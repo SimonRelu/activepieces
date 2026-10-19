@@ -43,7 +43,16 @@ case "$AP_CONTAINER_TYPE" in
         node --enable-source-maps "$WORKER_SCRIPT" &
         worker_pid=$!
 
-        trap 'kill "$app_pid" "$worker_pid" 2>/dev/null' TERM INT
+        # Stop the worker first and keep the app up until it exits: a draining worker
+        # reports its in-flight jobs through this app (AP_WORKER_DRAIN_TIMEOUT_SECONDS).
+        shutdown() {
+            kill "$worker_pid" 2>/dev/null
+            wait "$worker_pid" 2>/dev/null
+            kill "$app_pid" 2>/dev/null
+            wait "$app_pid" 2>/dev/null
+            exit 0
+        }
+        trap shutdown TERM INT
 
         while kill -0 "$app_pid" 2>/dev/null && kill -0 "$worker_pid" 2>/dev/null; do
             sleep 1

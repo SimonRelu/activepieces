@@ -75,7 +75,7 @@ vi.mock('@activepieces/sandbox', () => ({
     }),
 }))
 
-import { findStalledLoopIndex, worker } from '../../src/lib/worker'
+import { findStalledLoopIndex, getDrainTimeoutMs, worker } from '../../src/lib/worker'
 
 function buildExtractPieceJob(): ExecuteExtractPieceMetadataJobData {
     return {
@@ -355,6 +355,46 @@ describe('worker integration', () => {
         expect(completeJobCalls.length).toBe(1)
         expect(completeJobCalls[0].jobId).toBe('job-timeout')
         expect(completeJobCalls[0].status).toBe(EngineResponseStatus.TIMEOUT)
+    }, 15_000)
+
+    it('stop() lets the in-flight job finish and report before disconnecting', async () => {
+        let markJobStarted: () => void = () => undefined
+        const jobStarted = new Promise<void>((resolve) => {
+            markJobStarted = resolve
+        })
+        mockGetHandler.mockReturnValue({
+            jobType: WorkerJobType.EXECUTE_EXTRACT_PIECE_INFORMATION,
+            execute: vi.fn(async () => {
+                markJobStarted()
+                await new Promise((resolve) => setTimeout(resolve, 500))
+                return { kind: JobResultKind.FIRE_AND_FORGET, status: EngineResponseStatus.OK }
+            }),
+        })
+        const completeJobCalls: CompleteJobCall[] = []
+        let handedOut = false
+        registerRpcServer({
+            poll: vi.fn(async () => {
+                if (handedOut) {
+                    return null
+                }
+                handedOut = true
+                return buildConsumeJobRequest({ jobId: 'job-draining' })
+            }),
+            completeJob: vi.fn(async (input) => {
+                completeJobCalls.push(input)
+            }),
+        })
+        await worker.start({
+            apiUrl: `http://127.0.0.1:${port}/api/`,
+            socketUrl: { url: `http://127.0.0.1:${port}`, path: '/api/socket.io' },
+            workerToken: 'test-token',
+        })
+
+        await jobStarted
+        await worker.stop()
+
+        expect(completeJobCalls.map((call) => call.jobId)).toEqual(['job-draining'])
+        expect(completeJobCalls[0].status).toBe(EngineResponseStatus.OK)
     }, 15_000)
 
     describe('resilience to invalid job data', () => {
@@ -646,6 +686,31 @@ describe('worker integration', () => {
             }
             throw new Error('Health server still reachable after disconnect')
         }, 15_000)
+    })
+})
+
+describe('getDrainTimeoutMs', () => {
+    afterEach(() => {
+        delete process.env.AP_WORKER_DRAIN_TIMEOUT_SECONDS
+    })
+
+    it('defaults to 25 seconds', () => {
+        expect(getDrainTimeoutMs()).toBe(25_000)
+    })
+
+    it('reads AP_WORKER_DRAIN_TIMEOUT_SECONDS', () => {
+        process.env.AP_WORKER_DRAIN_TIMEOUT_SECONDS = '1800'
+        expect(getDrainTimeoutMs()).toBe(1_800_000)
+    })
+
+    it('accepts 0 to skip the drain', () => {
+        process.env.AP_WORKER_DRAIN_TIMEOUT_SECONDS = '0'
+        expect(getDrainTimeoutMs()).toBe(0)
+    })
+
+    it.each(['', 'abc', '-5', '1.5'])('falls back to 25 seconds for %j', (value) => {
+        process.env.AP_WORKER_DRAIN_TIMEOUT_SECONDS = value
+        expect(getDrainTimeoutMs()).toBe(25_000)
     })
 })
 
