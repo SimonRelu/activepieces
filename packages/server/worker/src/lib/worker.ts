@@ -30,12 +30,12 @@ let shouldStartHealthServer = false
 
 let runtime: Runtime | null = null
 
-// Jobs executing across all poll loops. stop() waits for these to finish + report before tearing
-// down, so a deploy doesn't orphan them in the app's BullMQ `active` list. Abrupt death (OOM/SIGKILL)
-// still falls to the stalled-scan.
+// Jobs executing across all poll loops. stop() waits up to AP_WORKER_DRAIN_TIMEOUT_SECONDS for these
+// to finish + report before tearing down, so a deploy doesn't orphan them in the app's BullMQ `active`
+// list. Abrupt death (OOM/SIGKILL) still falls to the stalled-scan.
 let inFlightJobs = 0
 
-const DRAIN_TIMEOUT_MS = 25_000
+const FALLBACK_DRAIN_TIMEOUT_SECONDS = 25
 
 // Sandbox memory/state is UI-only telemetry (the workers page). Computing it needs a full
 // process-table scan (si.processes()), so it must NOT run on the poll hot path — sampling it on
@@ -296,8 +296,21 @@ async function pollAndExecute(apiClient: WorkerToApiContract, runtime: Runtime, 
     workerLog.warn({ polling, generation, connectionGeneration }, 'Poll loop exited — this worker consumes no jobs until it starts again')
 }
 
+export function getDrainTimeoutMs(): number {
+    const rawSeconds = (system.get(WorkerSystemProp.WORKER_DRAIN_TIMEOUT_SECONDS) ?? '').trim()
+    if (!/^\d+$/.test(rawSeconds)) {
+        logger.warn({ rawSeconds }, `Invalid AP_WORKER_DRAIN_TIMEOUT_SECONDS value, falling back to ${FALLBACK_DRAIN_TIMEOUT_SECONDS}`)
+        return FALLBACK_DRAIN_TIMEOUT_SECONDS * 1000
+    }
+    return Number(rawSeconds) * 1000
+}
+
 async function drainInFlightJobs(): Promise<void> {
-    const deadline = Date.now() + DRAIN_TIMEOUT_MS
+    const drainTimeoutMs = getDrainTimeoutMs()
+    if (inFlightJobs > 0) {
+        logger.info({ inFlightJobs, drainTimeoutMs }, 'Draining in-flight jobs before shutdown')
+    }
+    const deadline = Date.now() + drainTimeoutMs
     while (inFlightJobs > 0 && Date.now() < deadline) {
         await sleep(100)
     }
